@@ -344,6 +344,15 @@ the extra VRAM is negligible.
 | API: three code edits at once, total | 78.4-84.0 | 89.3-90.5 |
 | single requests, MTP rejoin after a batch | unchanged | unchanged |
 
+**Tail skip for CPU experts** (`EXL3_MOE_TAIL_SKIP=7`, served launcher). Strata's route tail skip on the CPU split:
+in a decode job, a CPU-resident expert that every row ranks 7th or lower among its 10 picks (by routing weight) is not
+computed, and its share of the routed sum is dropped (the other picks keep their weights). It skips ~45% of the CPU
+picks. Teacher-forced 3-token windows (`rocm_tests/tail_skip_check.py`, 1,800 tokens of prose, code and chat): KL
+0.037 against no skip with a run-to-run floor of 0.0098, top-1 94.1% (floor 97.1%), forced-text perplexity x0.995.
+Task level, iqbench through the API on the same build, seeds and settings (MMLU-Pro 80, MATH-500 level 4-5 30,
+HumanEval 60, thinking on): 71 / 29 / 56 correct with and without the skip, one question either way on MMLU-Pro and on
+HumanEval. MTP decode, one request: code 72.9 -> 90.5 tok/s, prose 58.0 -> 64.5.
+
 **Short prompts read together** (`EXL3_PREFILL_GROUP=1`; needs `greenlet`; off in the served launcher since 2026-10-10 while two decode hangs at 200K+ contexts that followed its deployment are investigated). A prompt chunk streams
 every CPU expert that enough of its tokens route to over PCIe, so a short chunk pays a near-fixed cost: through the
 Generator (`rocm_tests/prefill_short_ab.py`, mcs 362), 1K tokens take 2.3 s, 2K 2.75 s, 4K 4.1 s and 6K 5.1 s, about
@@ -835,7 +844,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_MTP_BATCH_MIN`, `EXL3_MTP_BATCH_DRAFTS` | 0 (off), 0 (3 and 0 in the served launcher) | with at least MIN decoding jobs, MTP drafts per job (0 = none; the MTP layer still writes its K/V) |
 | `EXL3_MTP_LOOKUP_BATCH` | 0 (1 in the served launcher) | prompt lookup for jobs in a batch, in place of their MTP draft, when it pays for the padding |
 | `EXL3_GDN_REPLAY` | 0 (1 in the served launcher) | GDN rewind by replay: 2 recurrent states per slot instead of max_history + 1 |
-| `EXL3_MOE_TAIL_SKIP`, `EXL3_MOE_TAIL_STATS` | 0, 0 | decode: a CPU-resident expert that every row of the job ranks this (1-based) or lower among its top-k picks is not computed (Strata's route tail skip; changes the output slightly); `_STATS=N` prints the skipped share every N jobs |
+| `EXL3_MOE_TAIL_SKIP`, `EXL3_MOE_TAIL_STATS` | 0 (7 in the served launcher), 0 | decode: a CPU-resident expert that every row of the job ranks this (1-based) or lower among its top-k picks is not computed (Strata's route tail skip; changes the output slightly); `_STATS=N` prints the skipped share every N jobs |
 | `EXL3_PREFILL_GROUP`, `EXL3_PREFILL_GROUP_LOG` | 0, 0 | prompt chunks of several jobs that fit in one chunk run their CPU/streamed experts once over all rows (needs `greenlet`); `_LOG` prints each group |
 | `EXL3_MB_OVERLAP`, `EXL3_MB_OVERLAP_MIN` | 0 (1 in the served launcher), 3 | decode batches of at least MIN rows as two micro-batches interleaved per CPU-split MoE layer (needs `greenlet`); `seq` = same split without interleaving |
 | `EXL3_KV_STREAM_STATS`, `EXL3_KV_STREAM_VERIFY` | 0, 0 | print slot hit counters every N calls; check every streamed read against the host copy (debug, slow) |
