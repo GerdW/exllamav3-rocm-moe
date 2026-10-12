@@ -78,6 +78,11 @@ class MoeCpuTuning:
         self.num_slots = int(os.environ.get("EXL3_MOE_CPU_SLOTS", 4))
         assert 1 <= self.num_slots <= 8, "EXL3_MOE_CPU_SLOTS must be 1..8 (MOE_MAX_SLOTS in moe_handoff.h)"
         self.cap_rows = int(os.environ.get("EXL3_MOE_CPU_SLOT_ROWS", 64))
+        # Tail skip for decode-size jobs (moe_split_issue_kernel): a CPU-resident expert that every row ranks this
+        # (1-based) or lower among its top-k picks is not computed, 0 = off. Changes the output slightly (Strata's
+        # STRATA_ROUTE_TAIL_SKIP, default 7 there). EXL3_MOE_TAIL_STATS=N prints the skipped share every N jobs
+        self.tail_skip = int(os.environ.get("EXL3_MOE_TAIL_SKIP", 0))
+        self.tail_stats = int(os.environ.get("EXL3_MOE_TAIL_STATS", 0))
         # Thread count fallback chain ends here; config.infer_params.moe_cpu_threads (or the
         # draft/MTP equivalent) takes precedence per host when set (MoeCpuHost.__init__)
         self.threads = int(os.environ.get("EXL3_MOE_CPU_THREADS", max(1, (os.cpu_count() or 2) // 2)))
@@ -1038,11 +1043,22 @@ class MoeCpuHost:
             if self.slot_last_seq[slot_idx]:
                 ext.exl3_moe_flag_wait(slot["consumed"], self.slot_last_seq[slot_idx],
                                        self.gpu_base_ptr + 128)
+            stats = None
+            if TUNING.tail_stats:
+                stats = self.dev_count.get((dev, "tail"))
+                if stats is None:
+                    stats = self.dev_count[(dev, "tail")] = torch.zeros((2,), dtype = torch.long, device = dev)
+                self._tail_jobs = getattr(self, "_tail_jobs", 0) + 1
+                if self._tail_jobs % TUNING.tail_stats == 0:
+                    c, s = stats.tolist()
+                    print(f" -- tail skip (rank >= {TUNING.tail_skip}): {s}/{c} CPU-resident picks skipped "
+                          f"({100 * s / max(c, 1):.1f}%) over {self._tail_jobs} jobs", flush = True)
             ext.moe_split_issue(
                 selected_experts.view(-1), split_map, split_hist,
                 y, routing_weights,
                 slot["sel_dev"], slot["x_dev"], slot["w_dev"],
                 counts, slot_idx, hi, first_cpu,
+                TUNING.tail_skip, stats,
             )
             ext.exl3_moe_flag_write(slot["data_ready"], seq)
             self.slot_last_seq[slot_idx] = seq

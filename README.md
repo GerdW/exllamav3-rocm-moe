@@ -835,6 +835,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_MTP_BATCH_MIN`, `EXL3_MTP_BATCH_DRAFTS` | 0 (off), 0 (3 and 0 in the served launcher) | with at least MIN decoding jobs, MTP drafts per job (0 = none; the MTP layer still writes its K/V) |
 | `EXL3_MTP_LOOKUP_BATCH` | 0 (1 in the served launcher) | prompt lookup for jobs in a batch, in place of their MTP draft, when it pays for the padding |
 | `EXL3_GDN_REPLAY` | 0 (1 in the served launcher) | GDN rewind by replay: 2 recurrent states per slot instead of max_history + 1 |
+| `EXL3_MOE_TAIL_SKIP`, `EXL3_MOE_TAIL_STATS` | 0, 0 | decode: a CPU-resident expert that every row of the job ranks this (1-based) or lower among its top-k picks is not computed (Strata's route tail skip; changes the output slightly); `_STATS=N` prints the skipped share every N jobs |
 | `EXL3_PREFILL_GROUP`, `EXL3_PREFILL_GROUP_LOG` | 0, 0 | prompt chunks of several jobs that fit in one chunk run their CPU/streamed experts once over all rows (needs `greenlet`); `_LOG` prints each group |
 | `EXL3_MB_OVERLAP`, `EXL3_MB_OVERLAP_MIN` | 0 (1 in the served launcher), 3 | decode batches of at least MIN rows as two micro-batches interleaved per CPU-split MoE layer (needs `greenlet`); `seq` = same split without interleaving |
 | `EXL3_KV_STREAM_STATS`, `EXL3_KV_STREAM_VERIFY` | 0, 0 | print slot hit counters every N calls; check every streamed read against the host copy (debug, slow) |
@@ -870,6 +871,7 @@ verification from ~45 ms to ~14 ms per round.
 | `prefill_short_ab.py -m <model> [--lens ...] [--ts ...]` | short-prompt prefill time per streaming threshold (`stream_t`), interleaved in one load |
 | `prefill_group_check.py -m <model>` | grouped prefill vs separate: time until three short prompts have their first token, greedy tokens and first-token logits against the run-to-run spread |
 | `conc_prefill_api.py <url> <tag> <n> <tokens>` | n short prompts sent together through the API (n-gram rows warmed, prompt cache missed), first-token times |
+| `tail_skip_check.py -m <model> [--ranks 7,8,9]` | tail skip: teacher-forced decode-window KL, top-1 agreement and perplexity against no skip (and the run-to-run floor), skipped share, MTP decode speed |
 | `mb_overlap_check.py -m <model>` | micro-batch overlap vs the same split run sequentially (greedy, five jobs), against the sequential run-to-run spread; speed and extra VRAM per mode |
 | `kv_stream_unit.py` | KV streaming kernels vs a torch reference: multi-step selections, eviction pressure, invalidating writes, page copies |
 | `kv_stream_check.py -m <model> --stream 0\|1 [--out F] [--ref F]` | greedy jobs (long prompt, shared prefix, recycled pages) with streaming off / on; with `EXL3_KV_STREAM_VERIFY=1` the bit-exact read check |

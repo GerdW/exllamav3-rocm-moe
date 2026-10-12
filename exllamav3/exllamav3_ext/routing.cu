@@ -893,7 +893,14 @@ void moe_split_map
 // traffic) when no selected expert is CPU-resident (common case with a hot/cold-swapped
 // tail). dev_count[slot] tells the collect kernel whether the worker produced anything. With
 // `map`, also translates sel to physical slots in place and bumps the hit histogram (the
-// dynamic-placement duties of moe_split_map)
+// dynamic-placement duties of moe_split_map).
+//
+// Tail skip (tail_rank R > 0, EXL3_MOE_TAIL_SKIP): a CPU-resident expert that every row of the job ranks R-th or
+// lower among its top-k picks (by routing weight, 1-based) is left out: its picks get the -1 sentinel, so the worker
+// does not compute it and its share of the routed sum is dropped (the other picks keep their weights). The rule is
+// Strata's STRATA_ROUTE_TAIL_SKIP, applied over all rows of the job. stats (optional, int64 [2]) accumulates the
+// CPU-resident picks and the skipped ones
+#define MOE_SPLIT_ISSUE_MAX_N 1024
 __global__ void moe_split_issue_kernel
 (
     int64_t* __restrict__ sel,           // (rows * topk,) router ids; physical slots out (map mode)
@@ -910,14 +917,20 @@ __global__ void moe_split_issue_kernel
     const int h_,
     const int hi,
     const int first_cpu,
-    const int slot_idx
+    const int slot_idx,
+    const int topk,
+    const int tail_rank,
+    unsigned long long* __restrict__ stats
 )
 {
     __shared__ int s_any;
+    __shared__ int s_lc[MOE_SPLIT_ISSUE_MAX_N];
+    __shared__ unsigned char s_rank[MOE_SPLIT_ISSUE_MAX_N];
     const int t = threadIdx.x;
     if (t == 0) s_any = 0;
     __syncthreads();
 
+    const bool tail = tail_rank > 0 && n <= MOE_SPLIT_ISSUE_MAX_N && topk > 0;
     int any = 0;
     for (int i = t; i < n; i += blockDim.x)
     {
@@ -929,8 +942,50 @@ __global__ void moe_split_issue_kernel
             sel[i] = p;
         }
         int32_t lc = p >= first_cpu ? (int32_t)(p - first_cpu) : -1;
-        h_sel[i] = lc;
-        any |= (lc >= 0);
+        if (tail)
+        {
+            // 0-based rank of this pick in its row: picks with a larger weight, ties broken by position
+            const int row0 = (i / topk) * topk;
+            const float wi = __half2float(w[i]);
+            int r = 0;
+            for (int j = 0; j < topk; ++j)
+            {
+                const float wj = __half2float(w[row0 + j]);
+                r += (wj > wi) || (wj == wi && row0 + j < i);
+            }
+            s_lc[i] = lc;
+            s_rank[i] = (unsigned char) r;
+        }
+        else
+        {
+            h_sel[i] = lc;
+            any |= (lc >= 0);
+        }
+    }
+    if (tail)
+    {
+        __syncthreads();
+        int n_cpu = 0, n_skip = 0;
+        for (int i = t; i < n; i += blockDim.x)
+        {
+            int32_t lc = s_lc[i];
+            if (lc >= 0)
+            {
+                // Kept when any row ranks this expert above the tail
+                bool keep = false;
+                for (int k = 0; k < n && !keep; ++k)
+                    keep = s_lc[k] == lc && s_rank[k] < tail_rank - 1;
+                n_cpu++;
+                if (!keep) { n_skip++; lc = -1; }
+            }
+            h_sel[i] = lc;
+            any |= (lc >= 0);
+        }
+        if (stats && (n_cpu | n_skip))
+        {
+            atomicAdd(&stats[0], (unsigned long long) n_cpu);
+            atomicAdd(&stats[1], (unsigned long long) n_skip);
+        }
     }
     if (any) atomicOr(&s_any, 1);
     __syncthreads();
@@ -987,7 +1042,9 @@ void moe_split_issue
     at::Tensor dev_count,
     const int64_t slot_idx,
     const int64_t hi,
-    const int64_t first_cpu
+    const int64_t first_cpu,
+    const int64_t tail_rank,
+    const c10::optional<at::Tensor>& stats
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(sel.device());
@@ -1013,7 +1070,9 @@ void moe_split_issue
         reinterpret_cast<half*>(h_x_ptr),
         reinterpret_cast<half*>(h_w_ptr),
         (int32_t*) dev_count.data_ptr(),
-        n, rows, h_, (int) hi, (int) first_cpu, (int) slot_idx
+        n, rows, h_, (int) hi, (int) first_cpu, (int) slot_idx,
+        rows > 0 ? n / rows : 0, (int) tail_rank,
+        stats ? (unsigned long long*) stats.value().data_ptr() : nullptr
     );
     cuda_check(cudaPeekAtLastError());
 }
