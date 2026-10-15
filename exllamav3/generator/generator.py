@@ -1193,6 +1193,30 @@ class Generator:
         return draft_ids
 
 
+    def _log_cache_wait(self, job):
+        """
+        A job that has waited over a minute to start: once a minute, what it needs against what the page table has,
+        and how many referenced pages the active jobs actually hold (referenced pages beyond those would be stuck)
+        """
+        now = time.time()
+        t0 = getattr(job, "_wait_t0", None)
+        if t0 is None:
+            job._wait_t0 = now
+            return
+        if now - t0 < 60 or now - getattr(job, "_wait_logged", 0) < 60:
+            return
+        job._wait_logged = now
+        held = set()
+        for j in self.active_jobs:
+            for seq in j.sequences:
+                for page in seq.allocated_pages:
+                    held.add(id(page))
+        print(f" -- waiting {now - t0:.0f} s to start: prompt {len(job.sequences[0].input_ids)} tokens needs "
+              f"{job.current_new_pages_required()} pages; {self.pagetable.num_unreferenced_pages()} unreferenced, "
+              f"{len(self.pagetable.referenced_pages)} referenced (active jobs hold {len(held)}), "
+              f"{len(self.active_jobs)} active, {len(self.pending_jobs)} pending, batch {self.max_batch_size}",
+              flush = True)
+
     def _prefill_group_select(self, jobs):
         """
         Jobs whose next prompt chunks are read together this round: single-sequence jobs with a prompt chunk pending
@@ -1840,6 +1864,7 @@ class Generator:
                 if (len(job.sequences) + current_max_batch > self.max_batch_size or
                         job.current_new_pages_required() > self.pagetable.num_unreferenced_pages()):
                     skipped_jobs.append(job)
+                    self._log_cache_wait(job)
                     continue
 
                 # Make sure the job we're about to add doesn't skip a job that's been skipped too many times
