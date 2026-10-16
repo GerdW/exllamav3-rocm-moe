@@ -115,4 +115,40 @@ Plus fork-only trees: `rocm/` (scripts, TabbyAPI patches and configs, `rdna3-for
 
 ## 7. Verification log
 
-(see the end of this file; filled in as tests are run)
+Branch `merge-upstream-v1.6.2`, merge commit `208fc1cb` (+ the unit test commit), tested 2026-10-16 on gfx1201.
+
+| Check | Result |
+|---|---|
+| Build `setup.py build_ext` in `tcclaviger/vllm` (torch 2.11+rocm10.0, hip 7.15), `PYTORCH_ROCM_ARCH=gfx1201` | 174/174 units, return code 0, 0 `error:` lines, about 10 min with `MAX_JOBS=3` |
+| `import exllamav3_ext` without GPU | 205 symbols, `kv_stream_copy` and `batched_scan_replay` present |
+| Unit test `tests/generator/test_async_generator_threaded_.py` (stubbed generator, no GPU) | 4 passed: accepted job, rejected job in plain mode, rejected job in threaded mode reaches its consumer and is untracked |
+| Load of Qwen3.8 Flash-Next 5.05 bpw (exl3) with 400 CPU experts, MTP draft, vision, 262144 context Q8, `max_batch_size: 2`, `EXL3_ASYNC_THREAD=1` | loaded in 91.6 s, version string `1.6.2` |
+| Functional gate (36 stress prompts 800 to 70000 characters, 3 tool calls, 2 images, 1863-token generation, prefix cache 2816/3008, 8-round history, history edited at an early position) | all ok, 0 journal errors |
+| Needle test 64k prose | 50/50 |
+| Prompt of about 400k tokens | HTTP 400 from TabbyAPI, instance healthy afterwards |
+| Client disconnect in the middle of a stream | next request fine, 0 tracebacks in the log |
+
+Speed (same machine, same model and config, 1 to 2 runs per number - indicative, not a benchmark). "fork" = the fork's
+`9528a5a` as served before (different model file: the non-abliterated one), "upstream" = plain v1.6.2 with the same config,
+"merged" = this branch, warm Triton cache:
+
+| | fork | upstream v1.6.2 | merged |
+|---|---|---|---|
+| one request, 800 tokens, code (tok/s) | 39.2 / 45.4 | 31.9 / 33.1 | 37.3 / 35.9 |
+| one request, 800 tokens, prose | 26.0 / 33.8 | 23.9 / 25.6 | 25.8 / 27.5 |
+| two at once, per request: code / prose | 24-27 / 20-22 | 16.7-18.5 / 14.2-15.2 | 19.0 / 15.6-15.8 |
+| 142k-token prompt plus a short request 15 s later: first token of the short one | 16.5 s | 53.1 s | 18.7 s |
+| same: first token of the long prompt | 205 s | 214 s | 207 s |
+| 64k prose: read / generate | 892 T/s / 41.7 tok/s | 689-712 T/s / 24.1-30.4 | 730 T/s / 27.2 |
+
+Readings (hypotheses, not proven): the threaded step (`EXL3_ASYNC_THREAD=1`) is what brings the short request back from 53 s to
+under 19 s, so backlog item 1 of section 6 is already largely covered by it; the remaining gap to the fork in concurrent decode
+is probably the fork's MoE placement/issue path (backlog item 3 and the fork's own learned placement), not measured.
+
+**Cold Triton cache warning:** the first ten minutes on an empty Triton cache ran at 13 tok/s instead of 36 (the first
+conc_test run of the merged branch). Reuse a persistent `TRITON_CACHE_DIR`.
+
+**Not tested:** gfx1100 (the maintainer's card), the CUDA build, tensor parallel, DFlash drafters, any model other than Flash-Next,
+three or more simultaneous slots, decoding beyond 64k context, KV streaming switched on, the checkpoint ladder under real memory
+pressure, and the rejected-enqueue path through a real server (only the stubbed unit test; TabbyAPI refuses over-long prompts
+before they reach the generator).
