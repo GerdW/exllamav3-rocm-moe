@@ -220,3 +220,54 @@ over. Only one prompt was checked for sanity; no task benchmark was run.
 Gumbel-coupled MTP drafts and prompt lookup (needs per-position seeds in upstream's sequential verification, no presample path in
 upstream), n-gram next-chunk staging and prefill micro-optimisations (backlog items 5 and 7), the RDNA3 kernels (item 8), the graph
 re-instantiation (item 9; not needed while `EXL3_GRAPHS` stays off on ROCm).
+
+## 9. Phase 2b results: pinned arena, quality checks, fork control (gfx1201, 2026-10-16, afternoon)
+
+All numbers: same machine, same model file (Qwen3.8 Flash-Next 5.05 bpw, abliterated, bf16 n-gram), same TabbyAPI config (400 CPU
+experts of 512, MTP draft, vision, 262144 context Q8, `max_batch_size: 2`), learned stats file, `EXL3_ASYNC_THREAD=1`, one to two runs each.
+
+### 9.1 Pinned arena works here (`EXL3_MOE_PINNED_ARENA=1`) and is the biggest single gain
+
+Safety first: a guard script killed the container below 3.5 GB `MemAvailable` (never triggered), `EXL3_HOST_MEM_RESERVE_MB=6000`.
+Observed: `MemAvailable` stayed at 17-20 GB with the 57 GB expert arena loaded, `Mlocked` 48 kB (the CUDA host registration is not counted
+there), no stall, load 63 s. The log shows `promote-on-miss ... 4 spare slots`; hit rate on the GPU 51-67 percent.
+Not changed: `/sys/kernel/mm/transparent_hugepage/shmem_enabled` is `never` on this host, so the shared arena runs on 4K pages
+(upstream documents a few percent of decode lost on some hosts; `within_size` would be the setting).
+
+| | fork control (today) | merged, unpinned, host cores 0 | **merged, pinned arena** | pinned + tail rank 8 |
+|---|---|---|---|---|
+| one request, code (tok/s) | 34.8 / 43.2 | 34.3 / 36.5 | 51.4 / 41.6 | **55.5 / 51.4** |
+| one request, prose | 24.7 / 28.7 | 22.3 / 26.0 | 24.9 / 31.7 | **31.5 / 36.8** |
+| two at once, code (per request) | 22.7 / 25.7 | 19.0 / 19.6 | 21.9 / 21.2 | **23.8 / 26.1** |
+| two at once, prose | 18.6 / 19.8 | 15.0 / 15.2 | 18.1 / 17.6 | **20.7 / 21.9** |
+| 142k prompt: first token of the long prompt | 217 s | 200 s | **136 s** | - |
+| same: first token of a short request sent 15 s later | 18.5 s | 16.8 s | **13.4 s** | - |
+| 64k prose: read / generate | 856 T/s / 34.4 | 747 / 25.1 | **1125 / 30.9** | - |
+| 64k needle test | 50/50 | 50/50 | 50/50 | - |
+
+(The fork control is the production code `9528a5a` with its production environment, run through the same scripts today; the
+41.7 tok/s for 64k generation measured on 2026-10-11 was not reproduced today.)
+
+### 9.2 Tail skip quality checks
+
+- Local code check `rocm_tests/codecheck.py` (23 small Python tasks with assertions, greedy): rank 8: 23/23, rank 7: 23/23, off: 23/23.
+- Degeneration probe `rocm_tests/degprobe.py` (5 long prompts, 500 tokens, greedy; repeated-4-gram share and compression ratio): rank 7 and rank 8
+  are within noise of "off" (code 8.9 / 7.8 / 8.4 percent repeated, prose 0.7 / 0.7 / 0.5, sql 67.5 / 66.4 / 66.1 which is the SQL boilerplate itself).
+  Text identical with "off" only for the first 50-250 characters (expected: different experts drop out, greedy paths diverge).
+- The derailed output seen once with rank 7 (section 8.4) was **not reproducible**: six later fresh instances with the same flags (also after load and
+  eight swap sweeps, also with and without the pinned arena) produced normal code. Cause unknown; one suspicion is the first-run autotune of the
+  fused MoE kernels before `$XDG_CACHE_HOME/exllamav3/autotune` existed. Treat tail skip as experimental; default stays off; rank 8 was never seen to fail.
+
+### 9.3 Gumbel-coupled MTP drafts: implemented, cannot engage through TabbyAPI, no effect measured
+
+Branch `phase2-coupled` (not merged into `phase2`): job-side seeds per verification position, draft sampling through the `Model.lm_head_argmax` hook.
+Debug trace (`EXL3_MTP_COUPLED_DEBUG=1`) shows why nothing happens: `Job.can_presample_window()` is false because `sampler.reqs_past_ids` is
+true for every request that comes through TabbyAPI (even with a preset that has no penalties and explicit zero penalties), and the dynamic draft
+calibrator disables it as well. With the coupling forced off or "on" the acceptance was identical (e.g. 302/392 and 303/388 drafted tokens accepted).
+The same restriction (past-ids) existed in the fork. Left out of the merge.
+
+### 9.4 Recommended production settings for this machine if the merge replaces the fork
+
+`EXL3_MOE_PINNED_ARENA=1`, `EXL3_MOE_HOST_CORES=0`, `cpu_moe_threads: 16`, `EXL3_ASYNC_THREAD=1`, `EXL3_HOST_MEM_RESERVE_MB=6000`, a persistent
+`XDG_CACHE_HOME` and `TRITON_CACHE_DIR`, the learned stats file; dropped (no longer exist): `EXL3_NOGRAPH`, `EXL3_GDN_REPLAY`, `EXL3_RDNA3_ATTN`. Optional:
+`EXL3_MOE_TAIL_SKIP=8`. Keep the fork tree for rollback.
