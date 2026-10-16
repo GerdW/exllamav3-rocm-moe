@@ -245,7 +245,9 @@ bool exl3_moe_split_issue_fused
     int64_t first_cpu,
     uintptr_t data_ready_flag,
     uintptr_t consumed_flag,
-    uintptr_t abort_flag
+    uintptr_t abort_flag,
+    int64_t tail_rank,
+    const c10::optional<at::Tensor>& stats
 )
 {
     uint8_t* base = reinterpret_cast<uint8_t*>(shm_base);
@@ -268,7 +270,7 @@ bool exl3_moe_split_issue_fused
     const at::cuda::OptionalCUDAGuard device_guard(y.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(y.get_device()).stream();
     if (prev_seq) flag_wait_on(stream, consumed_flag, prev_seq, abort_flag);
-    moe_split_issue(sel, map, hist, y, w, h_sel_ptr, h_x_ptr, h_w_ptr, dev_count, slot, hi, first_cpu);
+    moe_split_issue(sel, map, hist, y, w, h_sel_ptr, h_x_ptr, h_w_ptr, dev_count, slot, hi, first_cpu, tail_rank, stats);
     flag_write_on(stream, data_ready_flag, seq);
     return true;
 }

@@ -80,6 +80,16 @@ def _align64(x):
     return (x + 63) & ~63
 
 
+
+# Tail skip for decode-size jobs (fork, from Strata's STRATA_ROUTE_TAIL_SKIP): a CPU-resident expert that every row of the
+# job ranks this (1-based) or lower among its top-k picks is not computed (0 = off). Changes the output slightly; measured
+# on the fork's gfx1100 with MTP decode: R=7 skips 45 % of the CPU picks for +25 % (code) / +11 % (prose) tokens/s at
+# top-1 agreement 94.1 % (run-to-run floor 97.1 %), KL 0.037 (floor 0.0098). EXL3_MOE_TAIL_STATS=N prints the skipped share
+# every N jobs
+_tail_skip = int(os.environ.get("EXL3_MOE_TAIL_SKIP", 0))
+_tail_stats = int(os.environ.get("EXL3_MOE_TAIL_STATS", 0))
+
+
 class MoeCpuTuning:
     """
     Tunable knobs for the CPU MoE offload path, collected in one place: env vars are read once
@@ -1374,7 +1384,7 @@ class MoeCpuHost:
         args = (self.base_ptr, seq, layer_idx, rows, spec["topk"], slot_idx, self.slot_last_seq[slot_idx],
                 selected_experts.view(-1), split_map, split_hist, y, routing_weights,
                 slot["sel_dev"], slot["x_dev"], slot["w_dev"], counts, spec["hi"], first_cpu,
-                slot["data_ready"], slot["consumed"], self.gpu_base_ptr + 128)
+                slot["data_ready"], slot["consumed"], self.gpu_base_ptr + 128, _tail_skip, self._tail_stats_tensor(dev))
         if not ext.exl3_moe_split_issue_fused(*args):
             import time
             while int(self.v_jobs_tail[0]) - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
@@ -1384,6 +1394,20 @@ class MoeCpuHost:
             ext.exl3_moe_split_issue_fused(*args)
         self.slot_last_seq[slot_idx] = seq
         return (seq, slot_idx, rows, h_, spec["ho"], dev, counts)
+
+    def _tail_stats_tensor(self, dev):
+        """int64 [picks on the CPU, picks skipped] counter for EXL3_MOE_TAIL_STATS; prints every N issued jobs"""
+        if not (_tail_skip and _tail_stats):
+            return None
+        stats = self.dev_count.get((dev, "tail"))
+        if stats is None:
+            stats = self.dev_count[(dev, "tail")] = torch.zeros((2,), dtype = torch.long, device = dev)
+        self._tail_jobs = getattr(self, "_tail_jobs", 0) + 1
+        if self._tail_jobs % _tail_stats == 0:
+            c, sk = stats.tolist()
+            print(f" -- tail skip (rank >= {_tail_skip}): {sk}/{c} CPU-resident picks skipped "
+                  f"({100 * sk / max(c, 1):.1f}%) over {self._tail_jobs} jobs", flush = True)
+        return stats
 
     def submit_collect_fused(self, handle, final_2d):
         """Fold the worker's partial into final_2d (rows, h) in place, straight from the

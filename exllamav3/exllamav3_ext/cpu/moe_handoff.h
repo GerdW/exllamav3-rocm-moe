@@ -119,7 +119,8 @@ bool exl3_moe_split_issue_fused
     at::Tensor sel, const c10::optional<at::Tensor>& map, const c10::optional<at::Tensor>& hist,
     const at::Tensor& y, const at::Tensor& w, int64_t h_sel_ptr, int64_t h_x_ptr, int64_t h_w_ptr,
     at::Tensor dev_count, int64_t hi, int64_t first_cpu,
-    uintptr_t data_ready_flag, uintptr_t consumed_flag, uintptr_t abort_flag
+    uintptr_t data_ready_flag, uintptr_t consumed_flag, uintptr_t abort_flag,
+    int64_t tail_rank = 0, const c10::optional<at::Tensor>& stats = c10::nullopt
 );
 void exl3_moe_split_collect_fused
 (

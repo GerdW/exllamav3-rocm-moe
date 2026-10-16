@@ -59,7 +59,9 @@ void moe_split_issue
     at::Tensor dev_count,
     const int64_t slot_idx,
     const int64_t hi,
-    const int64_t first_cpu
+    const int64_t first_cpu,
+    const int64_t tail_rank,
+    const c10::optional<at::Tensor>& stats
 );
 
 void moe_split_collect_add
