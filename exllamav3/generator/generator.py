@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import os
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -14,6 +15,10 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
+# Stall watchdog (fork): a single iterate() that runs longer than this many seconds dumps every thread's stack to stderr
+# and ends the process (a supervisor restarts it). A hung GPU <-> CPU-expert handoff otherwise leaves the server spinning
+# in a device synchronize forever while its health endpoint still reports healthy. 0 disables
+_watchdog_s = float(os.environ.get("EXL3_WATCHDOG_S", 300))
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +26,7 @@ from .sampler import Sampler
 from .visualizer import CacheVisualizer
 import time
 import threading
+import faulthandler
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 
@@ -188,6 +194,11 @@ class Generator:
 
         :param kwargs:
         """
+
+        # Fork: stall watchdog thread (see _watchdog_s)
+        self._iter_t0 = None
+        if _watchdog_s > 0:
+            threading.Thread(target = self._watchdog, name = "exl3-watchdog", daemon = True).start()
 
         self.model = model
         self.cache = cache
@@ -597,6 +608,37 @@ class Generator:
 
     @torch.inference_mode
     def iterate(self) -> list[dict]:
+        """Performs inference on available jobs; see _iterate for the result format"""
+        self._iter_t0 = time.time()
+        # Backstop for the watchdog thread: a hung GPU stream can block the generator thread inside a call that holds
+        # the GIL (a pageable host-to-device copy), and then the Python thread never runs; one hang was noticed 1178 s
+        # in instead of 300. faulthandler's timer is a C thread: 30 s after the Python watchdog should have fired, it
+        # dumps every thread's stack and exits with status 1 without needing the GIL
+        if _watchdog_s > 0:
+            faulthandler.dump_traceback_later(_watchdog_s + 30, exit = True)
+        try:
+            return self._iterate()
+        finally:
+            self._iter_t0 = None
+            if _watchdog_s > 0:
+                faulthandler.cancel_dump_traceback_later()
+
+
+    def _watchdog(self):
+        while True:
+            time.sleep(min(30.0, _watchdog_s / 4))
+            t0 = self._iter_t0
+            if t0 is not None and time.time() - t0 > _watchdog_s:
+                import sys
+                print(f" !! exllamav3 watchdog: one generator iteration has run for {time.time() - t0:.0f} s "
+                      f"(EXL3_WATCHDOG_S={_watchdog_s:.0f}); dumping stacks and exiting", file = sys.stderr, flush = True)
+                faulthandler.dump_traceback(file = sys.stderr, all_threads = True)
+                sys.stderr.flush()
+                os._exit(70)
+
+
+    @torch.inference_mode
+    def _iterate(self) -> list[dict]:
         """
         Performs inference on available jobs.
 
