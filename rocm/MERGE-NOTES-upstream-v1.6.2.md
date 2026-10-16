@@ -100,14 +100,14 @@ Plus fork-only trees: `rocm/` (scripts, TabbyAPI patches and configs, `rdna3-for
 `README.exllamav3.md` (upstream's README).
 
 **Phase 2 backlog** (each item = one commit with a measurement; fork commit hashes in brackets):
-1. Decode between prompt chunks, generator off the event loop [`f5a558d8`] - this is the part that keeps a short request
+1. (covered by `EXL3_ASYNC_THREAD=1`, see section 8) Decode between prompt chunks, generator off the event loop [`f5a558d8`] - this is the part that keeps a short request
    responsive while a very long prompt is being read (measured on gfx1201 with two slots: first token of the short request
    16.5 s with the fork vs 53 s with plain upstream while a 142k prompt is read).
 2. Gumbel-coupled MTP drafts and prompt lookup, batched [`4af70aa8`, `b3673605`, `bb926c1b`] (`Model.lm_head_argmax` hook is in place).
-3. Tail skip for CPU-resident experts [`886b4e2d`, `960ed40e`]: needs the change in upstream's fused split-issue kernel.
-4. Standby nap for the CPU MoE workers [`e4a82826`, fork PR #3]: `cpu/moe_idle.h` is in the tree, the worker-loop hooks are not.
+3. **DONE (branch `phase2`)** Tail skip for CPU-resident experts [`886b4e2d`, `960ed40e`], carried through upstream's fused split-issue kernel. See section 8 for the rank that is safe on gfx1201.
+4. **DONE (branch `phase2`)** Standby nap for the CPU MoE workers [`e4a82826`, fork PR #3, original author kept].
 5. Next-chunk n-gram staging and the n-gram prefetch switches [`d726a3cf`, `a83bdef7`, `92a0990d`] (`prefetch_next` in `ple.py` is in place).
-6. Stall watchdog [`32f8418f`, `aef16ef3`] and the cache-wait log line [`1c049a13`].
+6. **DONE (branch `phase2`)** Stall watchdog [`32f8418f`, `aef16ef3`] and the cache-wait log line [`1c049a13`].
 7. DeltaNet prefill conv in place [`24f82f0f`], gated residual single kernel [`b247165c`], MoE prefill batched down projection [`1ab433ec`], QSA prefill single-stage pipelining [`3f086b8a`].
 8. RDNA3 (gfx11) kernels in `rocm/rdna3-fork-kernels/` and the dispatch hooks for them: only for the maintainer's hardware; each needs
    a benchmark against upstream's `rocm/` kernels (`rocm_tests/test_rdna3_*.py`).
@@ -152,3 +152,71 @@ conc_test run of the merged branch). Reuse a persistent `TRITON_CACHE_DIR`.
 three or more simultaneous slots, decoding beyond 64k context, KV streaming switched on, the checkpoint ladder under real memory
 pressure, and the rejected-enqueue path through a real server (only the stubbed unit test; TabbyAPI refuses over-long prompts
 before they reach the generator).
+
+## 8. Phase 2 results and operating notes (gfx1201, 2026-10-16)
+
+Branch `phase2` = phase 1 + four commits: standby nap, stall watchdog, cache-wait log line, tail skip. Built 174/174 units, no errors.
+
+### 8.1 The most important finding: upstream's host-core reservation throttles this stack
+
+Symptom: right after every start, decode ran at 13-15 tok/s for a long time and became fast (35-40) only after a very long prefill
+had run, while the fork code started at 25-37 tok/s. What it was NOT (each tested, all still slow): Triton cache cold or warm,
+hugepage collapse (`EXL3_MOE_ARENA_HUGEPAGE=0`), static versus dynamic placement (`EXL3_MOE_CPU_SWAP=0`), the learned profile
+(`EXL3_MOE_CPU_SPLIT_STATS` file versus the profile saved by upstream), the 15 versus 16 worker thread mismatch, disk reads (vmstat `bi` 0),
+swap, draft acceptance (83 percent in a slow request).
+
+What it was: `EXL3_MOE_HOST_CORES` (default 1). Upstream plans the worker pool on all but one physical core and confines the whole
+host process (the generator thread, CUDA driver threads, the API server) to that one core and its SMT sibling. The log line is
+`CPU MoE host affinity: host on LPs [15, 31]`. `mpstat` showed exactly those two logical processors at 85-89 percent while every
+worker thread idled at about 25 percent: the host side was the bottleneck. Our host is heavier than upstream's reference setup
+(threaded generator step, TabbyAPI with MTP drafting, two slots).
+
+Decode of one long code prompt (600 tokens, 400 CPU experts of 512, Ryzen 9 7945HX3D with 16 physical cores, `cpu_moe_threads` = 16 minus host cores):
+
+| `EXL3_MOE_HOST_CORES` | 1 (default) | 2 | 3 | 4 | **0** |
+|---|---|---|---|---|---|
+| tok/s right after start | 15 | 20 | 23-24 | 25 | **31-34** |
+
+`EXL3_MOE_HOST_CORES=0` (no reservation, no pinning, workers float) gives the fork's behaviour. Recommendation for this machine:
+`EXL3_MOE_HOST_CORES=0`, `cpu_moe_threads: 16`. If the reservation is wanted on a lighter host: the placement is planned once from the
+first worker that starts (here the 1-layer MTP head with 15 threads) and then kept for the 16-thread main worker
+(`placement planned for 15 workers, kept for a 16-thread worker`); keep both counts equal.
+
+### 8.2 Prerequisites of the upstream features that were not met in our setup (read from doc/env_vars.md)
+
+- Promote-on-miss and `EXL3_MOE_CPU_PROMOTE` need the pinned arena (`EXL3_MOE_PINNED_ARENA=1`, config `moe_cpu_pinned_arena`).
+  We did not set it, so promote-on-miss was never active in any measurement here; the periodic swap sweep ran instead.
+  The pinned arena page-locks the expert memory (`cudaHostRegister`); on this 90 GB machine that is the setting that once locked
+  about 73 GiB and made the machine unusable, so it was deliberately not tried. Open question.
+- The learned expert profile is written to `$XDG_CACHE_HOME/exllamav3/expert_stats/<hash>.json` (default `~/.cache`, which is
+  lost with a `--rm` container). `EXL3_MOE_CPU_SPLIT_STATS` takes precedence over it.
+- `exllamav3/autotune/coop_autotune_v1.bin` is written to the same cache directory.
+
+### 8.3 Measurements with `EXL3_MOE_HOST_CORES=0`, learned stats file, `EXL3_ASYNC_THREAD=1`, from a cold start
+
+| | fork (11.10., other model file) | merged, tail skip off | tail rank 9 | tail rank 8 |
+|---|---|---|---|---|
+| one request, code, tok/s | 39-45 | 34-36 | 39.1 | **41.2** |
+| one request, prose | 26-34 | 22-26 | 26.5 | **28.7** |
+| two at once, code / prose | 24-27 / 20-22 | 19.0-19.6 / 15.0-15.2 | 21.1 / 16.9 | **22.5 / 17.6** |
+| 142k prompt + short request: first token of the short one | 16.5 s | 16.8 s | - | - |
+| same: first token of the long prompt | 205 s | 199.5 s | - | - |
+| 64k prose read / generate | 892 T/s / 41.7 | 747 T/s / 25.1 | - | - |
+| 64k needle test | 50/50 | 50/50 | - | - |
+
+One to two runs each, indicative. The 64k generation figure is clearly below the fork's and is unexplained.
+
+### 8.4 Tail skip on this setup: rank 7 breaks the output
+
+`EXL3_MOE_TAIL_SKIP=7` (the rank the fork serves with) made Flash-Next 5.05 bpw (abliterated variant) derail on the coding prompt at
+temperature 0: after the imports it emitted endless `import dict / import list / ...` lines (the MTP acceptance of such text is
+high, which is why raw speed looked good while a long `min_tokens` request ran at 15 tok/s). Ranks 8, 9 and 10 gave normal code.
+So on this model the safe rank is 8 or higher (+14-17 percent decode at rank 8), the default stays 0 (off), and a quality check
+is needed before enabling it on another model. The fork's measured KL of 0.037 at rank 7 (gfx1100, 3.05 bpw model) does not carry
+over. Only one prompt was checked for sanity; no task benchmark was run.
+
+### 8.5 Not done in phase 2
+
+Gumbel-coupled MTP drafts and prompt lookup (needs per-position seeds in upstream's sequential verification, no presample path in
+upstream), n-gram next-chunk staging and prefill micro-optimisations (backlog items 5 and 7), the RDNA3 kernels (item 8), the graph
+re-instantiation (item 9; not needed while `EXL3_GRAPHS` stays off on ROCm).
