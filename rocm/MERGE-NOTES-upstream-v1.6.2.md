@@ -96,7 +96,7 @@ Every deviation is listed in section 5.
 `util/memory.py`, `architecture/{glm4v,qwen2_5_vl,qwen3_vl}.py` + `architecture/mm_processing/qwen2.py` (pad images smaller than one
 merged patch instead of failing the request), `cpu/moe_idle.h` + `tests/test_moe_cpu_idle_.py` (files only; not wired yet),
 `generator/adaptive_window.py`, `generator/prefill_group.py`, `util/ablation.py` (files only; not wired).
-Plus fork-only trees: `rocm/` (scripts, TabbyAPI patches and configs, `rdna3-fork-kernels/`), `rocm_tests/`, `README.md`,
+Plus fork-only trees: `rocm/` (scripts, TabbyAPI patches and configs, `rdna3-fork-kernels/`, `tools/`), `rocm_tests/`, `README.md`,
 `README.exllamav3.md` (upstream's README).
 
 **Phase 2 backlog** (each item = one commit with a measurement; fork commit hashes in brackets):
@@ -250,8 +250,8 @@ Not changed: `/sys/kernel/mm/transparent_hugepage/shmem_enabled` is `never` on t
 
 ### 9.2 Tail skip quality checks
 
-- Local code check `rocm_tests/codecheck.py` (23 small Python tasks with assertions, greedy): rank 8: 23/23, rank 7: 23/23, off: 23/23.
-- Degeneration probe `rocm_tests/degprobe.py` (5 long prompts, 500 tokens, greedy; repeated-4-gram share and compression ratio): rank 7 and rank 8
+- Local code check `rocm/tools/codecheck.py` (23 small Python tasks with assertions, greedy): rank 8: 23/23, rank 7: 23/23, off: 23/23.
+- Degeneration probe `rocm/tools/degprobe.py` (5 long prompts, 500 tokens, greedy; repeated-4-gram share and compression ratio): rank 7 and rank 8
   are within noise of "off" (code 8.9 / 7.8 / 8.4 percent repeated, prose 0.7 / 0.7 / 0.5, sql 67.5 / 66.4 / 66.1 which is the SQL boilerplate itself).
   Text identical with "off" only for the first 50-250 characters (expected: different experts drop out, greedy paths diverge).
 - The derailed output seen once with rank 7 (section 8.4) was **not reproducible**: six later fresh instances with the same flags (also after load and
@@ -270,4 +270,64 @@ The same restriction (past-ids) existed in the fork. Left out of the merge.
 
 `EXL3_MOE_PINNED_ARENA=1`, `EXL3_MOE_HOST_CORES=0`, `cpu_moe_threads: 16`, `EXL3_ASYNC_THREAD=1`, `EXL3_HOST_MEM_RESERVE_MB=6000`, a persistent
 `XDG_CACHE_HOME` and `TRITON_CACHE_DIR`, the learned stats file; dropped (no longer exist): `EXL3_NOGRAPH`, `EXL3_GDN_REPLAY`, `EXL3_RDNA3_ATTN`. Optional:
-`EXL3_MOE_TAIL_SKIP=8`. Keep the fork tree for rollback.
+`EXL3_MOE_TAIL_SKIP=8` (the conservative rank, see section 10). Keep the fork tree for rollback.
+
+## 10. Tail skip: quality and speed measurements (gfx1201, 2026-10-16/17)
+
+Tools used: `rocm/tools/tail_skip_check_merge.py` (KL / top-1 / perplexity against rank 0, speed; needs a text directory, `TEXT_DIR`),
+`rocm/tools/iqbench_paired.py` (paired task comparison; the test server polls a rank file, `EXL3_MOE_TAIL_RANKFILE`; needs the data files written by
+`rocm_tests/iqbench_data.py`), `rocm/tools/codecheck.py`, `rocm/tools/degprobe.py`. Tail skip stays **off by default**; rank 8 is the conservative choice
+(rank 7 produced one derailed output on this setup, see sections 8.4 and 9.2; the maintainer serves rank 7 on a 3.05 bpw model without problems, so this is model dependent).
+
+### 10.1 Quality
+
+#### Distribution shift of tail skip (KL / top-1 against tail skip off, 1800 tokens of mixed prose and code)
+
+| | KL mean | KL p99 | top-1 agreement | perplexity | CPU expert picks skipped |
+|---|---|---|---|---|---|
+| noise floor (off vs off, run-to-run) | 0.0144 | 0.152 | 94.7 % | x1.0066 | 0 % |
+| rank 9 | 0.0367 | 0.390 | 92.2 % | x1.0057 | 20.9 % |
+| rank 8 | 0.0472 | 0.461 | 90.4 % | x1.0067 | 30.9 % |
+| rank 7 | 0.0578 | 0.550 | 90.3 % | x1.0087 | 40.7 % |
+
+So rank 8 is clearly above the run-to-run noise in KL and top-1 (about 3x the KL), while perplexity is indistinguishable from the noise floor. The run-to-run noise itself is not zero because the CPU expert path is not bit-reproducible.
+
+#### Paired task comparison (same questions, same seeds, one server, tail rank switched per request; off vs rank 8)
+
+| set | questions | off | rank 8 | only off right / only rank 8 right |
+|---|---|---|---|---|
+| MMLU-Pro | 80 | 73 (91.2 %) | 71 (88.8 %) | 3 / 1 |
+| MATH-500 | 30 | 27 (90.0 %) | 27 (90.0 %) | 0 / 0 |
+| HumanEval | 60 | 58 (96.7 %) | 58 (96.7 %) | 0 / 0 |
+
+170 questions, 4 flips in total, none statistically significant (3:1 on MMLU-Pro is well inside chance). This is a small sample and one run per rank, so it can only rule out large losses, not small ones. Average answer length on MMLU-Pro went from 324 to 383 tokens with rank 8 (MATH 229 to 239, HumanEval 34 to 34), which eats part of the speed gain on that set.
+
+#### Other checks
+
+Code check 23/23 with and without rank 8; degeneration probe (five 2k-token generations per rank, repeated-4-gram share and zlib ratio) shows no difference between off and rank 8 (the SQL prompt is repetitive in both, 64 % vs 66 %); no errors or GPU faults in the server log over 2 h 15 min. Speed in the same run: rank 7 gave +29 % (code) and +17 % (prose) over off.
+
+**Conclusion:** keep tail skip off by default and document it as an opt-in speed/quality trade-off, with rank 8 or 9 as the suggested values. The merge itself (everything except tail skip) does not depend on it.
+
+### 10.2 Speed (absolute numbers, 2026-10-17)
+
+Absolute numbers (the relative figures above carry no prompt-processing (PP) values). Same machine and server as before (gfx1201, Flash-Next 5.05 bpw, pinned arena, `EXL3_MOE_HOST_CORES=0`, threaded step, 400 of 512 experts on the CPU). One server process, tail skip rank switched through a file between passes in the order off, 8, 8, off so that drift cancels out. Greedy decoding, 400 generated tokens per request, a unique marker at the start of every prompt so the prefix cache cannot help. Method as in LLMSpeedTest: PP = new prompt tokens / (time to first response minus base latency), decode = (tokens - 1) / (last minus first token).
+
+**Decode speed, short context (3 runs per pass, 6 per rank, median and range)**
+
+| | tail skip off | tail skip rank 8 | change |
+|---|---|---|---|
+| code | 46.2 tok/s (32.8 - 51.3) | 56.1 tok/s (48.1 - 59.8) | +21 % |
+| prose | 43.2 tok/s (26.8 - 46.0) | 46.4 tok/s (39.7 - 50.7) | +7 % |
+
+**64k context (about 62k prompt tokens, 2 passes per rank)**
+
+| | tail skip off | tail skip rank 8 |
+|---|---|---|
+| PP, prose | 1104 / 1138 tok/s | 1130 / 1093 tok/s |
+| PP, code text | 1012 / 939 tok/s | 1119 / 1091 tok/s |
+| decode at 62k context, prose | 32.9 / 32.7 tok/s | 39.3 / 39.1 tok/s |
+| decode at 62k context, code text | 34.3 / 35.4 tok/s | 42.6 / 43.4 tok/s |
+
+Reading: tail skip speeds up **decode** (+7 % to +23 % here), and **PP is not affected** (the differences in the PP rows are within the run-to-run spread of about 5 to 10 %, and go in both directions). The first request after a rank switch is often the slowest of its series, so the ranges are wide; the medians are the safer figure. Two passes and six runs per rank is a small sample, indicative only. These absolute numbers differ from the afternoon figures in section 8.3 (for example prose 25 / 32 there with tail skip off, 43 here); those were one or two runs each right after a server start, and I did not isolate the reason for the difference, so compare the off / rank 8 ratios within this table rather than absolutes across runs.
+
+Not measured: two concurrent requests with rank 8 in this run (the section 8.3 figures still stand), and PP at other context sizes.
